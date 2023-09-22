@@ -99,7 +99,11 @@ def set_conformation2(x, smiles):
         conformer = mol.GetConformer(0)
         for atom_idx in range(mol.GetNumAtoms()):
             atom_pos = conformer.GetAtomPosition(atom_idx)
-            pos[i,atom_idx,:] = atom_pos
+            # Convert the Point3D object to a NumPy array
+            atom_pos_np = np.array([atom_pos.x, atom_pos.y, atom_pos.z])
+            # Assuming pos is a PyTorch FloatTensor
+            pos[i,atom_idx,:] = torch.FloatTensor(atom_pos_np)
+            # pos[i,atom_idx,:] = atom_pos
 
     return pos
 
@@ -155,7 +159,7 @@ class Graphormer_0904(pl.LightningModule):
                 self.edge_dis_encoder = nn.Embedding(
                     128 * num_heads * num_heads, 1)
             self.rel_pos_encoder = nn.Embedding(512, num_heads, padding_idx=0) # TODO: change to float input
-            self.rel_pos_encoder2 = nn.Linear(3,num_heads) # expand
+            self.rel_pos_encoder2 = nn.Linear(1,num_heads) # expand
             self.in_degree_encoder = nn.Embedding(
                 512, hidden_dim, padding_idx=0)
             self.out_degree_encoder = nn.Embedding(
@@ -199,12 +203,18 @@ class Graphormer_0904(pl.LightningModule):
     def forward(self, batched_data, perturb=None):
         # rel_pos: SPD
         # x: Batch * Atom * F
+
+        sample_idx = batched_data.idx # TODO: idx of samples
+
         attn_bias, rel_pos, x = batched_data.attn_bias, batched_data.rel_pos, batched_data.x
         in_degree, out_degree = batched_data.in_degree, batched_data.in_degree
         edge_input, attn_edge_type = batched_data.edge_input, batched_data.attn_edge_type
         
         ## TODO: get_conformation: Batch * atom * 3
-        smiles = batched_data.metadata
+        # import pandas as pd
+        # smiles_data = pd.read_csv('/home/wzh/Graphormer-change/dataset/ogbg_molpcba/mapping/mol.csv.gz', compression='gzip', header = None, skiprows=1)[128].astype(str)
+        # smiles = smiles_data[sample_idx.tolist()]
+        smiles = batched_data.smiles
         batch_position = set_conformation2(x, smiles)
         # batch_position = set_conformation(x, attn_edge_type)
 
@@ -229,9 +239,11 @@ class Graphormer_0904(pl.LightningModule):
         graph_attn_bias = graph_attn_bias.unsqueeze(1).repeat(
             1, self.num_heads, 1, 1)  # [n_graph, n_head, n_node+1, n_node+1]
 
-        # rel pos
+        ## TODO rel pos
         # [n_graph, n_node, n_node, n_head] -> [n_graph, n_head, n_node, n_node]
-        rel_pos_bias = self.rel_pos_encoder2(rel_pos).permute(0, 3, 1, 2)
+        device = torch.cuda.current_device()
+        rel_pos = rel_pos.to(device)
+        rel_pos_bias = self.rel_pos_encoder2(rel_pos.unsqueeze(-1)).permute(0, 3, 1, 2)
         graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:,
                                                         :, 1:, 1:] + rel_pos_bias  # spatial encoder
         # reset rel pos here

@@ -11,6 +11,9 @@ import pyximport
 pyximport.install(setup_args={'include_dirs': np.get_include()})
 import algos
 
+import os
+os.environ['PyDEWD_MARN_SLOW_RESOLVE_TIMEOUT'] = '10'  # Set the timeout to 10 seconds (or higher as needed)
+
 
 def convert_to_single_emb(x, offset=512):
     feature_num = x.size(1) if len(x.size()) > 1 else 1
