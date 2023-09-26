@@ -91,9 +91,23 @@ def set_conformation2(x, smiles):
         mol = Chem.MolFromSmiles(smiles[i])
 
         # Generate 3D coordinates
-        mol = Chem.AddHs(mol)  # Add hydrogens for a more realistic 3D structure
-        AllChem.EmbedMolecule(mol, randomSeed=21)  # Generate 3D coordinates
-        mol = Chem.RemoveHs(mol) # remove for pos
+        # mol = Chem.AddHs(mol)  # Add hydrogens for a more realistic 3D structure
+        # AllChem.EmbedMolecule(mol, randomSeed=1)  # Generate 3D coordinates
+        # AllChem.MMFFOptimizeMolecule(mol) # may help the bad conformation
+        # mol = Chem.RemoveHs(mol) # remove for pos
+
+        # from uni-mol, num_confs change from 1000 to 100
+        mol = Chem.AddHs(mol)
+        allconformers = AllChem.EmbedMultipleConfs(
+            mol, numConfs=100, randomSeed=42, clearConfs=True
+        )
+        sz = len(allconformers)
+        for j in range(sz):
+            try:
+                AllChem.MMFFOptimizeMolecule(mol, confId=i) # lowest energy
+            except:
+                continue
+        mol = Chem.RemoveHs(mol)
 
         # Access the 3D coordinates
         conformer = mol.GetConformer(0)
@@ -159,7 +173,7 @@ class Graphormer_0904(pl.LightningModule):
                 self.edge_dis_encoder = nn.Embedding(
                     128 * num_heads * num_heads, 1)
             self.rel_pos_encoder = nn.Embedding(512, num_heads, padding_idx=0) # TODO: change to float input
-            self.rel_pos_encoder2 = nn.Linear(1,num_heads) # expand
+            self.rel_pos_encoder2 = nn.Linear(1,num_heads) # TODO: expand, may not be a good choice
             self.in_degree_encoder = nn.Embedding(
                 512, hidden_dim, padding_idx=0)
             self.out_degree_encoder = nn.Embedding(
