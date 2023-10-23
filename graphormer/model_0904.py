@@ -12,6 +12,7 @@ from utils.flag import flag_bounded
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem import rdDistGeom as molDG
 import networkx as nx
 
 import torch.nn.functional as F
@@ -90,24 +91,25 @@ def set_conformation2(x, smiles):
     for i in range(x.shape[0]):
         mol = Chem.MolFromSmiles(smiles[i])
 
-        # Generate 3D coordinates
-        # mol = Chem.AddHs(mol)  # Add hydrogens for a more realistic 3D structure
+        ## Generate 3D coordinates
+        mol = Chem.AddHs(mol)  # Add hydrogens for a more realistic 3D structure
         # AllChem.EmbedMolecule(mol, randomSeed=1)  # Generate 3D coordinates
-        # AllChem.MMFFOptimizeMolecule(mol) # may help the bad conformation
-        # mol = Chem.RemoveHs(mol) # remove for pos
+        AllChem.EmbedMolecule(mol, maxAttempts=5000)
+        AllChem.UFFOptimizeMolecule(mol) # may help the bad conformation
+        mol = Chem.RemoveHs(mol) # remove for pos
 
-        # from uni-mol, num_confs change from 1000 to 100
-        mol = Chem.AddHs(mol)
-        allconformers = AllChem.EmbedMultipleConfs(
-            mol, numConfs=100, randomSeed=42, clearConfs=True
-        )
-        sz = len(allconformers)
-        for j in range(sz):
-            try:
-                AllChem.MMFFOptimizeMolecule(mol, confId=i) # lowest energy
-            except:
-                continue
-        mol = Chem.RemoveHs(mol)
+        ## from uni-mol, num_confs change from 1000 to 100
+        # mol = Chem.AddHs(mol)
+        # allconformers = AllChem.EmbedMultipleConfs(
+        #     mol, numConfs=50, randomSeed=42, clearConfs=True
+        # )
+        # sz = len(allconformers)
+        # for j in range(sz):
+        #     try:
+        #         AllChem.MMFFOptimizeMolecule(mol, confId=i) # lowest energy
+        #     except:
+        #         continue
+        # mol = Chem.RemoveHs(mol)
 
         # Access the 3D coordinates
         conformer = mol.GetConformer(0)
@@ -120,6 +122,64 @@ def set_conformation2(x, smiles):
             # pos[i,atom_idx,:] = atom_pos
 
     return pos
+
+class NonLinear(nn.Module):
+    def __init__(self, input, output_size, hidden=None):
+        super(NonLinear, self).__init__()
+
+        if hidden is None:
+            hidden = input
+        self.layer1 = nn.Linear(input, hidden)
+        self.layer2 = nn.Linear(hidden, output_size)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = F.gelu(x)
+        x = self.layer2(x)
+        return x
+
+def inner_smi2coords(smi, seed=42, mode='fast', remove_hs=True):
+    mol = Chem.MolFromSmiles(smi)
+    mol = AllChem.AddHs(mol)
+    atoms = [atom.GetSymbol() for atom in mol.GetAtoms()]
+    assert len(atoms)>0, 'No atoms in molecule: {}'.format(smi)
+    try:
+        # will random generate conformer with seed equal to -1. else fixed random seed.
+        res = AllChem.EmbedMolecule(mol, randomSeed=seed)
+        if res == 0:
+            try:
+                # some conformer can not use MMFF optimize
+                AllChem.MMFFOptimizeMolecule(mol)
+                coordinates = mol.GetConformer().GetPositions().astype(np.float32)
+            except:
+                coordinates = mol.GetConformer().GetPositions().astype(np.float32)
+        ## for fast test... ignore this ###
+        elif res == -1 and mode == 'heavy':
+            AllChem.EmbedMolecule(mol, maxAttempts=5000, randomSeed=seed)
+            try:
+                # some conformer can not use MMFF optimize
+                AllChem.MMFFOptimizeMolecule(mol)
+                coordinates = mol.GetConformer().GetPositions().astype(np.float32)
+            except:
+                AllChem.Compute2DCoords(mol)
+                coordinates_2d = mol.GetConformer().GetPositions().astype(np.float32)
+                coordinates = coordinates_2d
+        else:
+            AllChem.Compute2DCoords(mol)
+            coordinates_2d = mol.GetConformer().GetPositions().astype(np.float32)
+            coordinates = coordinates_2d
+    except:
+        print("Failed to generate conformer, replace with zeros.")
+        coordinates = np.zeros((len(atoms),3))
+    assert len(atoms) == len(coordinates), "coordinates shape is not align with {}".format(smi)
+    if remove_hs:
+        idx = [i for i, atom in enumerate(atoms) if atom != 'H']
+        atoms_no_h = [atom for atom in atoms if atom != 'H']
+        coordinates_no_h = coordinates[idx]
+        assert len(atoms_no_h) == len(coordinates_no_h), "coordinates shape is not align with {}".format(smi)
+        return atoms_no_h, coordinates_no_h
+    else:
+        return atoms, coordinates
 
 class Graphormer_0904(pl.LightningModule):
     def __init__(
@@ -214,6 +274,9 @@ class Graphormer_0904(pl.LightningModule):
         self.automatic_optimization = not self.flag
         self.apply(lambda module: init_bert_params(module, n_layers=n_layers))
 
+        ## TODO
+        self.proj_layer = NonLinear(1, num_heads) # expand the last dimension
+
     def forward(self, batched_data, perturb=None):
         # rel_pos: SPD
         # x: Batch * Atom * F
@@ -229,20 +292,60 @@ class Graphormer_0904(pl.LightningModule):
         # smiles_data = pd.read_csv('/home/wzh/Graphormer-change/dataset/ogbg_molpcba/mapping/mol.csv.gz', compression='gzip', header = None, skiprows=1)[128].astype(str)
         # smiles = smiles_data[sample_idx.tolist()]
         smiles = batched_data.smiles
-        batch_position = set_conformation2(x, smiles)
+        # batch_position = set_conformation2(x, smiles)
         # batch_position = set_conformation(x, attn_edge_type)
 
         ## TODO: new rel_pos by conformation
-        batch_num = batch_position.shape[0]
-        atom_num = batch_position.shape[1]
-        new_rel_pos = torch.zeros([batch_num,atom_num,atom_num])
-        for i in range(batch_num):
-            for j in range(atom_num):
-                for k in range(j+1,atom_num):
-                    distance = torch.norm(batch_position[i,j] - batch_position[i,k],p=2)
-                    new_rel_pos[i,j,k] = distance
-                    new_rel_pos[i,k,j] = distance
-        rel_pos = new_rel_pos ## TODO: novel change #1
+        # batch_num = batch_position.shape[0]
+        # atom_num = batch_position.shape[1]
+        # new_rel_pos = torch.zeros([batch_num,atom_num,atom_num])
+        # for i in range(batch_num):
+        #     for j in range(atom_num):
+        #         for k in range(j+1,atom_num):
+        #             distance = torch.norm(batch_position[i,j] - batch_position[i,k],p=2)
+        #             new_rel_pos[i,j,k] = distance
+        #             new_rel_pos[i,k,j] = distance
+        # rel_pos = new_rel_pos ## TODO: novel change #1
+
+        ## TODO: get adj matrix
+        # rel_pos = torch.zeros([x.shape[0],x.shape[1],x.shape[1]])
+        # for i in range(x.shape[0]):
+        #     mol = Chem.MolFromSmiles(smiles[i])
+
+        #     # try:
+        #     #     AllChem.EmbedMolecule(mol)
+        #     # except:
+        #     #     print("Can't embed molecule at order "+str(i))
+
+        #     mol = Chem.AddHs(mol)
+
+        #     # Get order of non Hs
+        #     H_order = []
+        #     count = 0
+        #     for atom in mol.GetAtoms():
+        #         if atom.GetAtomicNum() != 1: 
+        #             H_order.append(count)
+        #         count = count + 1
+
+        #     dm=AllChem.Get3DDistanceMatrix(mol)
+        #     r_dm = dm[H_order,H_order] # remove Hs
+        #     mol = Chem.RemoveHs(mol)
+        #     r_dm = torch.from_numpy(r_dm)
+        #     zeroPad = nn.ZeroPad2d(padding=(0, x.shape[1]-r_dm.shape[1], 0, x.shape[1]-r_dm.shape[1]))
+        #     # zeroPad = np.pad(dm, ((0, x.shape[1]-dm.shape[1]),(0, x.shape[1]-dm.shape[1])), 'constant', constant_values=(0,0)) # padding
+        #     rel_pos[i] = zeroPad
+
+        ## TODO: get coordinates
+        pos = torch.zeros((x.shape[0],x.shape[1],3))
+        for i in range(x.shape[0]): 
+            atom, coord = inner_smi2coords(smiles[i])
+            coord = torch.from_numpy(coord)
+            zeroPad = nn.ZeroPad2d(padding=(0, 0, 0, x.shape[1]-coord.shape[1]))
+            pos[i] = zeroPad(coord)
+
+        delta_pos = pos.unsqueeze(1) - pos.unsqueeze(2)
+        rel_pos = delta_pos.norm(dim=-1).view(-1, pos.shape[0], pos.shape[0])
+        delta_pos /= rel_pos.unsqueeze(-1) + 1e-5 # normalize
 
         # rf_pred
         if self.dataset_name == 'ogbg-molhiv':
@@ -256,8 +359,25 @@ class Graphormer_0904(pl.LightningModule):
         ## TODO rel pos
         # [n_graph, n_node, n_node, n_head] -> [n_graph, n_head, n_node, n_node]
         device = torch.cuda.current_device()
-        rel_pos = rel_pos.to(device)
-        rel_pos_bias = self.rel_pos_encoder2(rel_pos.unsqueeze(-1)).permute(0, 3, 1, 2)
+        rel_pos = rel_pos.to(device) # [n_graph, n_node, n_node]
+
+        rel_pos_bias = self.gbf_proj(rel_pos.unsqueeze(-1)) # expand 1 dimension
+        rel_pos_bias = rel_pos_bias.view(n_graph, n_node, n_node, self.num_heads)
+
+        rel_pos_bias = rel_pos_bias.permute(0, 3, 1, 2).contiguous()
+        padding_mask = x.eq(0).all(dim=-1)
+        rel_pos_bias.masked_fill_(
+            padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
+        )
+
+        # rel_pos_bias = self.rel_pos_encoder2(rel_pos.unsqueeze(-1)).permute(0, 3, 1, 2)
+
+        ## TODO change
+        # tmp = torch.normal(0,0.1,rel_pos_bias.shape)
+        # device = torch.cuda.current_device()
+        # tmp = tmp.to(device)
+        # rel_pos_bias = rel_pos_bias + tmp
+
         graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:,
                                                         :, 1:, 1:] + rel_pos_bias  # spatial encoder
         # reset rel pos here
